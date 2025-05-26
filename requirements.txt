@@ -1,0 +1,17 @@
+numpy
+pandas
+
+matplotlib
+seaborn
+
+scikit-learn
+xgboost
+
+tensorflow
+
+warnings
+os
+
+pydotplus
+
+ipython
