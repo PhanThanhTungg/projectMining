@@ -8,6 +8,7 @@ import traceback
 from flask_cors import CORS
 from pymongo import MongoClient
 from datetime import datetime
+from sklearn.pipeline import Pipeline
 import uuid
 
 import time
@@ -23,6 +24,7 @@ app = Flask(__name__)
 CORS(app)
 
 model = None
+model_lightgbm = None
 scaler = None
 disease_mapping = None
 feature_names = None
@@ -30,10 +32,12 @@ collection = None
 
 def load_model_and_scaler():
     """Load model, scaler, disease mapping và feature names"""
-    global model, scaler, disease_mapping, feature_names, collection
-    
+    global model, model_lightgbm, scaler, disease_mapping, feature_names, collection
+
     try:
         model = joblib.load('./Models/custom_lgbm_model.joblib')
+
+        model_lightgbm = joblib.load('./Models/lightgbm_model.joblib')
         
         scaler = joblib.load('./Models/scaler.joblib')
         
@@ -54,6 +58,9 @@ def load_model_and_scaler():
     except Exception as e:
         print(f"Lỗi khi load model: {str(e)}")
         return False
+
+
+
 
 @app.route('/predict', methods=['POST'])
 def predict():
@@ -92,15 +99,34 @@ def predict():
         
         sorted_confidence = dict(sorted(confidence_scores.items(), 
                                       key=lambda x: x[1], reverse=True))
+
+        # LightGBM prediction
+        lightgbm_prediction = model_lightgbm.predict(features_scaled)[0]
+        lightgbm_proba = model_lightgbm.predict_proba(features_scaled)[0]
+        lightgbm_disease_name = disease_mapping.get(lightgbm_prediction, f"Unknown_{lightgbm_prediction}")
+        
+        sorted_lightgbm_confidence = dict(sorted(
+            {disease_mapping.get(i, f"Unknown_{i}"): float(prob) for i, prob in enumerate(lightgbm_proba)}.items(),
+            key=lambda x: x[1], reverse=True
+        ))
         
         return jsonify({
-            'predicted_disease': disease_name,
-            'predicted_class': int(prediction),
-            'confidence': float(prediction_proba[prediction]),
-            'all_probabilities': sorted_confidence,
-            'status': 'success'
+            'custom':{
+                'predicted_disease': disease_name,
+                'predicted_class': int(prediction),
+                'confidence': float(prediction_proba[prediction]),
+                'all_probabilities': sorted_confidence,
+                'status': 'success'
+            },
+            'lightgbm':{
+                'predicted_disease': lightgbm_disease_name,
+                'predicted_class': int(lightgbm_prediction),
+                'confidence': float(lightgbm_proba[lightgbm_prediction]),
+                'all_probabilities': sorted_lightgbm_confidence,
+                'status': 'success'
+            }
         })
-        
+
     except Exception as e:
         error_msg = f"Lỗi trong quá trình prediction: {str(e)}"
         print(f"{error_msg}")
@@ -167,24 +193,41 @@ def predict_batch():
         
         predictions = model.predict(features_scaled)
         predictions_proba = model.predict_proba(features_scaled)
+
+        #lightgbm predictions
+        lightgbm_predictions = model_lightgbm.predict(features_scaled)
+        lightgbm_predictions_proba = model_lightgbm.predict_proba(features_scaled)
         
         results = []
         for i, (original_features, pred, proba) in enumerate(zip(features, predictions, predictions_proba)):
             result_object = {}
+            result_object['custom'] = {}
             
             for j, feature_name in enumerate(feature_names):
-                result_object[feature_name] = float(original_features[j])
+                result_object['custom'][feature_name] = float(original_features[j])
             
-            result_object["predicted_disease"] = disease_mapping.get(pred, f"Unknown_{pred}")
-            result_object["predicted_class"] = int(pred)
-            result_object["confidence"] = float(proba[pred])
+            result_object["custom"]["predicted_disease"] = disease_mapping.get(pred, f"Unknown_{pred}")
+            result_object["custom"]["predicted_class"] = int(pred)
+            result_object["custom"]["confidence"] = float(proba[pred])
             
             confidence_scores = {}
             for class_idx, prob in enumerate(proba):
                 disease_class = disease_mapping.get(class_idx, f"Unknown_{class_idx}")
                 confidence_scores[disease_class] = float(prob)
             
-            result_object["all_probabilities"] = dict(sorted(confidence_scores.items(), 
+            result_object["custom"]["all_probabilities"] = dict(sorted(confidence_scores.items(), 
+                                                           key=lambda x: x[1], reverse=True))
+            
+            # LightGBM 
+            result_object['lightgbm'] = {}
+            result_object["lightgbm"]["predicted_disease"] = disease_mapping.get(lightgbm_predictions[i], f"Unknown_{lightgbm_predictions[i]}")
+            result_object["lightgbm"]["predicted_class"] = int(lightgbm_predictions[i])
+            result_object["lightgbm"]["confidence"] = float(lightgbm_predictions_proba[i][lightgbm_predictions[i]])
+            lightgbm_confidence_scores = {}
+            for class_idx, prob in enumerate(lightgbm_predictions_proba[i]):
+                disease_class = disease_mapping.get(class_idx, f"Unknown_{class_idx}")
+                lightgbm_confidence_scores[disease_class] = float(prob)
+            result_object["lightgbm"]["all_probabilities"] = dict(sorted(lightgbm_confidence_scores.items(),
                                                            key=lambda x: x[1], reverse=True))
             
             results.append(result_object)
@@ -439,11 +482,35 @@ def train_model():
         
         turbo_results = evaluate_model(turbo_lgbm, X_test_scaled, y_test, "TURBO LightGBM")
 
+        # Train LightGBM model
+        best_pipeline = Pipeline([
+            ('scaler', StandardScaler()),
+            ('classifier', LGBMClassifier(
+                learning_rate=0.1,
+                max_depth=-1,
+                min_child_samples=50,
+                n_estimators=300,
+                num_leaves=50,
+                random_state=42,
+                verbosity=-1
+            ))
+        ])
+        best_pipeline.fit(X_train_scaled, y_train)
+        joblib.dump(best_pipeline, './Models/lightgbm_model.joblib')
+
         return jsonify({
-            'status': 'success',
-            'message': 'Đã train model thành công',
-            'training_time': turbo_time,
-            'evaluation_results': turbo_results
+            "custom_lgbm":{
+                'status': 'success',
+                'message': 'Đã train model thành công',
+                'training_time': turbo_time,
+                'evaluation_results': turbo_results
+            },
+            "lightgbm":{
+                'status': 'success',
+                'message': 'Đã train LightGBM model thành công',
+                'training_time': time.time() - start_time,
+                'evaluation_results': evaluate_model(best_pipeline, X_test_scaled, y_test, "LightGBM")
+            }
         }), 200
     except Exception as e:
         print(f"Lỗi : {str(e)}")
