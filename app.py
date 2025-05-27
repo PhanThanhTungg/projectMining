@@ -6,6 +6,9 @@ import warnings
 from customeLGBM import TurboLightGBMClassifier
 import traceback
 from flask_cors import CORS
+from pymongo import MongoClient
+from datetime import datetime
+import uuid
 
 warnings.filterwarnings("ignore")
 
@@ -16,10 +19,11 @@ model = None
 scaler = None
 disease_mapping = None
 feature_names = None
+collection = None
 
 def load_model_and_scaler():
     """Load model, scaler, disease mapping và feature names"""
-    global model, scaler, disease_mapping, feature_names
+    global model, scaler, disease_mapping, feature_names, collection
     
     try:
         model = joblib.load('custom_lgbm_model.joblib')
@@ -34,6 +38,11 @@ def load_model_and_scaler():
             feature_names = [f"feature_{i+1}" for i in range(24)]
         
         print("✅ Model, scaler, disease mapping và feature names đã được load!")
+        
+        client = MongoClient("mongodb+srv://TungConnectDTB:TungConnectDTB@cluster0.berquuj.mongodb.net/")
+        db = client['mining']
+        collection = db['samples']
+        
         return True
     except Exception as e:
         print(f"Lỗi khi load model: {str(e)}")
@@ -99,43 +108,56 @@ def predict_batch():
                 'error': 'Model hoặc scaler chưa được load.'
             }), 500
         
-        data = request.get_json()
-        
-        if 'samples' not in data:
+        if 'file' not in request.files:
             return jsonify({
-                'error': 'Cần trường "samples" chứa list các samples'
+                'error': 'Cần upload file CSV'
             }), 400
         
-        samples = data['samples']
-        features_list = []
+        file = request.files['file']
         
-        for sample in samples:
-            if isinstance(sample, list):
-                if len(sample) != 24:
-                    return jsonify({
-                        'error': f'Mỗi sample cần đúng 24 features, nhận được {len(sample)}'
-                    }), 400
-                features_list.append(sample)
-            elif isinstance(sample, dict):
-                feature_array = []
-                for feature_name in feature_names:
-                    if feature_name in sample:
-                        feature_array.append(sample[feature_name])
-                    else:
-                        return jsonify({
-                            'error': f'Thiếu feature: {feature_name}'
-                        }), 400
-                features_list.append(feature_array)
-            else:
-                return jsonify({
-                    'error': 'Mỗi sample phải là list hoặc dictionary'
-                }), 400
+        if file.filename == '':
+            return jsonify({
+                'error': 'Không có file nào được chọn'
+            }), 400
         
-        features = np.array(features_list)
+        if not file.filename.endswith('.csv'):
+            return jsonify({
+                'error': 'File phải có định dạng CSV'
+            }), 400
+        
+        try:
+            df = pd.read_csv(file)
+        except Exception as e:
+            return jsonify({
+                'error': f'Lỗi khi đọc file CSV: {str(e)}'
+            }), 400
+        
+        if df.empty:
+            return jsonify({
+                'error': 'File CSV rỗng'
+            }), 400
+        
+        missing_features = []
+        for feature_name in feature_names:
+            if feature_name not in df.columns:
+                missing_features.append(feature_name)
+        
+        if missing_features:
+            return jsonify({
+                'error': f'Thiếu các feature sau trong file CSV: {missing_features}'
+            }), 400
+        
+        features_df = df[feature_names]
+        
+        if features_df.isnull().any().any():
+            return jsonify({
+                'error': 'File CSV chứa giá trị null/NaN'
+            }), 400
+        
+        features = features_df.values
         
         features_scaled = scaler.transform(features)
         
-        # Prediction
         predictions = model.predict(features_scaled)
         predictions_proba = model.predict_proba(features_scaled)
         
@@ -146,16 +168,30 @@ def predict_batch():
             for j, feature_name in enumerate(feature_names):
                 result_object[feature_name] = float(original_features[j])
             
-            result_object["target"] = disease_mapping.get(pred, f"Unknown_{pred}")
+            result_object["predicted_disease"] = disease_mapping.get(pred, f"Unknown_{pred}")
+            result_object["predicted_class"] = int(pred)
             result_object["confidence"] = float(proba[pred])
+            
+            confidence_scores = {}
+            for class_idx, prob in enumerate(proba):
+                disease_class = disease_mapping.get(class_idx, f"Unknown_{class_idx}")
+                confidence_scores[disease_class] = float(prob)
+            
+            result_object["all_probabilities"] = dict(sorted(confidence_scores.items(), 
+                                                           key=lambda x: x[1], reverse=True))
             
             results.append(result_object)
         
-        return jsonify(results)
+        return jsonify({
+            'status': 'success',
+            'total_samples': len(results),
+            'results': results
+        })
         
     except Exception as e:
         error_msg = f"Lỗi trong batch prediction: {str(e)}"
         print(f"{error_msg}")
+        print(traceback.format_exc())
         return jsonify({'error': error_msg}), 500
 
 @app.route('/model_info', methods=['GET'])
@@ -171,6 +207,156 @@ def model_info():
         'learning_rate': model.learning_rate,
         'max_depth': model.max_depth
     })
+
+@app.route('/upload_csv_data', methods=['POST'])
+def upload_csv_data():
+    """Upload file CSV và lưu data vào MongoDB"""
+    try:
+        if collection is None:
+            return jsonify({'error': 'Chưa kết nối MongoDB'}), 500
+        
+        # Kiểm tra file upload
+        if 'file' not in request.files:
+            return jsonify({
+                'error': 'Cần upload file CSV'
+            }), 400
+        
+        file = request.files['file']
+        
+        if file.filename == '':
+            return jsonify({
+                'error': 'Không có file nào được chọn'
+            }), 400
+        
+        if not file.filename.endswith('.csv'):
+            return jsonify({
+                'error': 'File phải có định dạng CSV'
+            }), 400
+        
+        # Đọc file CSV
+        try:
+            df = pd.read_csv(file)
+        except Exception as e:
+            return jsonify({
+                'error': f'Lỗi khi đọc file CSV: {str(e)}'
+            }), 400
+        
+        if df.empty:
+            return jsonify({
+                'error': 'File CSV rỗng'
+            }), 400
+        
+        print(f" File CSV có {len(df)} dòng và {len(df.columns)} cột")
+        print(f"Columns: {list(df.columns)}")
+        
+        # Kiểm tra target column
+        target_column = None
+        possible_targets = ['target', 'Target', 'disease', 'Disease', 'label', 'Label']
+        
+        for col in possible_targets:
+            if col in df.columns:
+                target_column = col
+                break
+        
+        if target_column is None:
+            return jsonify({
+                'error': f'Không tìm thấy cột target. Cần một trong các cột: {possible_targets}'
+            }), 400
+        
+        # Kiểm tra 24 features
+        feature_columns = [col for col in df.columns if col != target_column]
+        
+        if len(feature_columns) != 24:
+            return jsonify({
+                'error': f'Cần đúng 24 features, tìm thấy {len(feature_columns)} features. Target column: {target_column}'
+            }), 400
+        
+        # Validate data types và missing values
+        feature_df = df[feature_columns]
+        target_series = df[target_column]
+        
+        # Kiểm tra missing values
+        if feature_df.isnull().any().any():
+            null_counts = feature_df.isnull().sum()
+            null_features = null_counts[null_counts > 0].to_dict()
+            return jsonify({
+                'error': f'File CSV chứa giá trị null/NaN trong features: {null_features}'
+            }), 400
+        
+        if target_series.isnull().any():
+            return jsonify({
+                'error': f'Cột target "{target_column}" chứa giá trị null/NaN'
+            }), 400
+        
+        # Kiểm tra data types cho features (phải là số)
+        non_numeric_features = []
+        for col in feature_columns:
+            if not pd.api.types.is_numeric_dtype(feature_df[col]):
+                try:
+                    pd.to_numeric(feature_df[col])
+                except:
+                    non_numeric_features.append(col)
+        
+        if non_numeric_features:
+            return jsonify({
+                'error': f'Các features sau không phải là số: {non_numeric_features}'
+            }), 400
+        
+        # Chuẩn bị data để insert vào MongoDB
+        records_to_insert = []
+        insert_errors = []
+        
+        for index, row in df.iterrows():
+            try:
+                record = {}
+                
+                # Map features theo thứ tự feature_names
+                for i, feature_name in enumerate(feature_names):
+                    if i < len(feature_columns):
+                        feature_value = float(row[feature_columns[i]])
+                        record[feature_name] = feature_value
+                    else:
+                        # Nếu thiếu features, báo lỗi
+                        raise ValueError(f"Thiếu feature thứ {i+1}")
+                
+                # Add target
+                record['Disease'] = str(row[target_column])
+                
+                records_to_insert.append(record)
+                
+            except Exception as e:
+                insert_errors.append(f"Dòng {index + 1}: {str(e)}")
+        
+        if insert_errors:
+            return jsonify({
+                'error': 'Lỗi khi xử lý dữ liệu',
+                'details': insert_errors[:10]  # Chỉ hiển thị 10 lỗi đầu
+            }), 400
+        
+        # Insert vào MongoDB
+        if records_to_insert:
+            try:
+                result = collection.insert_many(records_to_insert)
+                inserted_count = len(result.inserted_ids)
+                
+                return jsonify({
+                    'status': 'success'
+                }), 201
+                
+            except Exception as e:
+                return jsonify({
+                    'error': f'Lỗi khi insert vào MongoDB: {str(e)}'
+                }), 500
+        else:
+            return jsonify({
+                'error': 'Không có data hợp lệ để insert'
+            }), 400
+            
+    except Exception as e:
+        error_msg = f"Lỗi khi upload CSV: {str(e)}"
+        print(f"{error_msg}")
+        print(traceback.format_exc())
+        return jsonify({'error': error_msg}), 500
 
 if __name__ == '__main__':
     print("Khởi động API server...")
