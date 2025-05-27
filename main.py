@@ -2,6 +2,7 @@ import pandas as pd
 import warnings
 from customeLGBM import TurboLightGBMClassifier, evaluate_model
 import time
+import joblib
 warnings.filterwarnings("ignore")
 
 if __name__ == "__main__":
@@ -48,9 +49,14 @@ if __name__ == "__main__":
     
     start_time = time.time()
     turbo_lgbm.fit(X_train_scaled, y_train)
+
+    # Lưu model, scaler và disease mapping
+    joblib.dump(turbo_lgbm, 'custom_lgbm_model.joblib')
+    joblib.dump(scaler, 'scaler.joblib')
+    joblib.dump(disease_mapping, 'disease_mapping.joblib')
+    
+    print("Đã lưu model, scaler và disease mapping!")
+    
     turbo_time = time.time() - start_time
     
     turbo_results = evaluate_model(turbo_lgbm, X_test_scaled, y_test, "TURBO LightGBM")
-    
-    
-    
