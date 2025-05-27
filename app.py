@@ -15,34 +15,29 @@ CORS(app)
 model = None
 scaler = None
 disease_mapping = None
+feature_names = None
 
 def load_model_and_scaler():
-    """Load model, scaler và disease mapping"""
-    global model, scaler, disease_mapping
+    """Load model, scaler, disease mapping và feature names"""
+    global model, scaler, disease_mapping, feature_names
     
     try:
-        # Load model
         model = joblib.load('custom_lgbm_model.joblib')
         
-        # Load scaler
         scaler = joblib.load('scaler.joblib')
         
-        # Load disease mapping
         disease_mapping = joblib.load('disease_mapping.joblib')
         
-        print("Model, scaler và disease mapping đã được load thành công!")
+        try:
+            feature_names = joblib.load('feature_names.joblib')
+        except:
+            feature_names = [f"feature_{i+1}" for i in range(24)]
+        
+        print("✅ Model, scaler, disease mapping và feature names đã được load!")
         return True
     except Exception as e:
         print(f"Lỗi khi load model: {str(e)}")
         return False
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({
-        'status': 'healthy',
-        'model_loaded': model is not None,
-        'scaler_loaded': scaler is not None
-    })
 
 @app.route('/predict', methods=['POST'])
 def predict():
@@ -116,10 +111,21 @@ def predict_batch():
         
         for sample in samples:
             if isinstance(sample, list):
+                if len(sample) != 24:
+                    return jsonify({
+                        'error': f'Mỗi sample cần đúng 24 features, nhận được {len(sample)}'
+                    }), 400
                 features_list.append(sample)
             elif isinstance(sample, dict):
-                df = pd.DataFrame([sample])
-                features_list.append(df.values[0])
+                feature_array = []
+                for feature_name in feature_names:
+                    if feature_name in sample:
+                        feature_array.append(sample[feature_name])
+                    else:
+                        return jsonify({
+                            'error': f'Thiếu feature: {feature_name}'
+                        }), 400
+                features_list.append(feature_array)
             else:
                 return jsonify({
                     'error': 'Mỗi sample phải là list hoặc dictionary'
@@ -129,31 +135,23 @@ def predict_batch():
         
         features_scaled = scaler.transform(features)
         
+        # Prediction
         predictions = model.predict(features_scaled)
         predictions_proba = model.predict_proba(features_scaled)
         
         results = []
-        for i, (pred, proba) in enumerate(zip(predictions, predictions_proba)):
-            disease_name = disease_mapping.get(pred, f"Unknown_{pred}")
+        for i, (original_features, pred, proba) in enumerate(zip(features, predictions, predictions_proba)):
+            result_object = {}
             
-            confidence_scores = {}
-            for class_idx, prob in enumerate(proba):
-                disease_class = disease_mapping.get(class_idx, f"Unknown_{class_idx}")
-                confidence_scores[disease_class] = float(prob)
+            for j, feature_name in enumerate(feature_names):
+                result_object[feature_name] = float(original_features[j])
             
-            results.append({
-                'sample_index': i,
-                'predicted_disease': disease_name,
-                'predicted_class': int(pred),
-                'confidence': float(proba[pred]),
-                'all_probabilities': confidence_scores
-            })
+            result_object["target"] = disease_mapping.get(pred, f"Unknown_{pred}")
+            result_object["confidence"] = float(proba[pred])
+            
+            results.append(result_object)
         
-        return jsonify({
-            'results': results,
-            'total_samples': len(results),
-            'status': 'success'
-        })
+        return jsonify(results)
         
     except Exception as e:
         error_msg = f"Lỗi trong batch prediction: {str(e)}"
