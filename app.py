@@ -3,12 +3,19 @@ import pandas as pd
 import numpy as np
 import joblib
 import warnings
-from customeLGBM import TurboLightGBMClassifier
+from customeLGBM import TurboLightGBMClassifier, evaluate_model
 import traceback
 from flask_cors import CORS
 from pymongo import MongoClient
 from datetime import datetime
 import uuid
+
+import time
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from lightgbm import LGBMClassifier
+import pandas as pd
 
 warnings.filterwarnings("ignore")
 
@@ -26,14 +33,14 @@ def load_model_and_scaler():
     global model, scaler, disease_mapping, feature_names, collection
     
     try:
-        model = joblib.load('custom_lgbm_model.joblib')
+        model = joblib.load('./Models/custom_lgbm_model.joblib')
         
-        scaler = joblib.load('scaler.joblib')
+        scaler = joblib.load('./Models/scaler.joblib')
         
-        disease_mapping = joblib.load('disease_mapping.joblib')
+        disease_mapping = joblib.load('./Models/disease_mapping.joblib')
         
         try:
-            feature_names = joblib.load('feature_names.joblib')
+            feature_names = joblib.load('./Models/feature_names.joblib')
         except:
             feature_names = [f"feature_{i+1}" for i in range(24)]
         
@@ -321,6 +328,14 @@ def upload_csv_data():
                 
                 # Add target
                 record['Disease'] = str(row[target_column])
+
+                # duplicate_check = collection.find_one({
+                #     'Disease': record['Disease'],
+                #     **{feature_name: record[feature_name] for feature_name in feature_names}
+                # })
+                # if duplicate_check:
+                #     print(f"Dòng {index + 1} đã tồn tại trong MongoDB, bỏ qua.")
+                #     continue
                 
                 records_to_insert.append(record)
                 
@@ -357,6 +372,82 @@ def upload_csv_data():
         print(f"{error_msg}")
         print(traceback.format_exc())
         return jsonify({'error': error_msg}), 500
+
+@app.route("/train_model", methods=['POST'])
+def train_model():
+    try:
+        cursor = collection.find({})
+        data_list = list(cursor)
+        if not data_list:
+            raise ValueError("Không có dữ liệu trong MongoDB")
+        print(f"Đã tải {len(data_list)} records từ MongoDB")
+        data = pd.DataFrame(data_list)
+        data.drop('_id', axis=1, inplace=True, errors='ignore')
+        print(f"DataFrame shape: {data.shape}")
+        print(f"Columns: {list(data.columns)}")
+        
+        if 'Disease' not in data.columns:
+            raise ValueError("Không tìm thấy cột 'target' trong dữ liệu")
+        
+        data.Disease = data.Disease.astype('category')
+        disease_mapping = dict(enumerate(data['Disease'].cat.categories))
+        print(f"Disease classes: {disease_mapping}")
+        
+        feature_names = data.drop('Disease', axis=1).columns.tolist()
+        print(f"Feature names: {feature_names}")
+        print(f"Number of features: {len(feature_names)}")
+        
+        data.Disease = data.Disease.cat.codes.values
+        X = data.drop('Disease', axis=1).values
+        y = data['Disease'].values
+        
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+        
+        # Standardize
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        
+        turbo_lgbm = TurboLightGBMClassifier(
+            n_estimators=100,
+            learning_rate=0.1,
+            max_depth=6,
+            num_leaves=31,
+            min_child_samples=20,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_lambda=0.1,
+            max_bins=255,
+            n_jobs=-1, 
+            random_state=42
+        )
+        
+        start_time = time.time()
+        turbo_lgbm.fit(X_train_scaled, y_train)
+
+        # Lưu model, scaler, disease mapping và feature names
+        joblib.dump(turbo_lgbm, './Models/custom_lgbm_model.joblib')
+        joblib.dump(scaler, './Models/scaler.joblib')
+        joblib.dump(disease_mapping, './Models/disease_mapping.joblib')
+        joblib.dump(feature_names, './Models/feature_names.joblib')
+
+        print("Đã lưu model, scaler, disease mapping và feature names!")
+        
+        turbo_time = time.time() - start_time
+        
+        turbo_results = evaluate_model(turbo_lgbm, X_test_scaled, y_test, "TURBO LightGBM")
+
+        return jsonify({
+            'status': 'success',
+            'message': 'Đã train model thành công',
+            'training_time': turbo_time,
+            'evaluation_results': turbo_results
+        }), 200
+    except Exception as e:
+        print(f"Lỗi : {str(e)}")
+        return jsonify({'error': f'Lỗi: {str(e)}'}), 500
 
 if __name__ == '__main__':
     print("Khởi động API server...")
